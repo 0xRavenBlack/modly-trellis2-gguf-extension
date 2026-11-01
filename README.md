@@ -15,6 +15,8 @@ The workflow above is the recommended starting point. It chains the two nodes ba
 1. **Generate Mesh** — takes an image and produces a geometry-only GLB
 2. **Texture Mesh** — takes the same image and the generated mesh, and bakes textures onto it
 
+The image is background-removed **once** per workflow: the matte computed by Generate Mesh is cached and reused by Texture Mesh, so rembg never runs twice on the same input. The foreground crop is re-applied per node, which is why both nodes should use the same `foreground_ratio`.
+
 ---
 
 ## Nodes

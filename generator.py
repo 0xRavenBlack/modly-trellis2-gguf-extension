@@ -13,15 +13,19 @@ Pipeline stages:
   4. Geometry export via cumesh remesh -> GLB
 
 Model weights are downloaded once to <models>/trellis2/generate/ and reused.
+The rembg matte is cached per image too, so a Generate Mesh -> Texture Mesh
+workflow cuts the background once instead of once per node.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import random
 import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -86,6 +90,23 @@ _MAX_NUM_TOKENS    = 150000
 # output and the Texture Mesh input so older/oversized meshes are handled too.
 _MAX_OUTPUT_FACES  = 1_000_000
 _MAX_TEXTURE_FACES = 1_000_000
+
+# White background the matted foreground is composited onto, and the RGB level
+# above which a pixel counts as background when locating the foreground bbox.
+# The threshold sits below pure white so anti-aliased edge halos stay inside the crop.
+_WHITE_RGB       = (255, 255, 255)
+_NEAR_WHITE_MIN  = 250
+
+# ── Image preprocessing caches (shared across node instances) ───────── #
+# A workflow feeds the *identical* image to Generate Mesh and Texture Mesh, and
+# both nodes preprocess it.  rembg matting is by far the costliest step (tens of
+# seconds of CPU inference), so the matte and the one-off onnxruntime session are
+# cached in module scope: the nodes are separate Trellis2GGUFGenerator instances
+# and an instance attribute would not dedupe anything.
+_MATTE_CACHE_MAX_ENTRIES = 2      # one full-size RGBA image per entry
+_matte_cache = OrderedDict()      # matte cache key -> matted RGBA image (read-only)
+_rembg_sessions = {}              # "cpu" | "auto" -> onnxruntime session
+_preprocess_cache_lock = threading.Lock()
 
 
 class Trellis2GGUFGenerator(BaseGenerator):
@@ -804,8 +825,13 @@ class Trellis2GGUFGenerator(BaseGenerator):
         self._ensure_gguf_files(gguf_quant, pipeline_type, progress_cb)
 
         # --- Pre-process image ---
-        self._report(progress_cb, 5, "Removing background...")
-        image_pil = self._preprocess(image_bytes, fg_ratio)
+        # rembg runs at most once per image across the whole workflow: the matte is
+        # cached module-wide, so the Texture Mesh node reuses this node's result.
+        image_pil = self._preprocess(
+            image_bytes,
+            fg_ratio,
+            report=lambda label: self._report(progress_cb, 5, label),
+        )
         self._check_cancelled(cancel_event)
 
         # --- Run pipeline ---
@@ -921,11 +947,18 @@ class Trellis2GGUFGenerator(BaseGenerator):
         self._check_cancelled(cancel_event)
 
         # --- Pre-process image ---
-        # force_cpu=True: the Trellis2 pipeline is already loaded in VRAM.
-        # rembg's onnxruntime CUDA provider crashes with error 700 under VRAM
-        # pressure, corrupting the PyTorch CUDA context for all subsequent calls.
-        self._report(progress_cb, 8, "Removing background...")
-        image_pil = self._preprocess(image_bytes, fg_ratio, force_cpu=True)
+        # Usually a matte-cache hit: Generate Mesh cut this exact image already and
+        # the cache is shared across node instances, so no onnxruntime session is
+        # created here.  When rembg does have to run it is forced to CPU providers,
+        # because the Trellis2 pipeline is resident in VRAM and onnxruntime's CUDA
+        # provider crashes with error 700 under pressure, corrupting the PyTorch
+        # CUDA context for every later torch.cuda call.
+        image_pil = self._preprocess(
+            image_bytes,
+            fg_ratio,
+            force_cpu=True,
+            report=lambda label: self._report(progress_cb, 8, label),
+        )
         self._check_cancelled(cancel_event)
 
         # --- Run texture pipeline ---
@@ -1512,46 +1545,66 @@ class Trellis2GGUFGenerator(BaseGenerator):
         seed = int(params.get("seed", -1))
         return random.randint(0, 2**31 - 1) if seed == -1 else seed
 
-    def _preprocess(self, image_bytes: bytes, fg_ratio: float, force_cpu: bool = False):
-        """Background removal (rembg) + foreground crop.
+    def _preprocess(self, image_bytes: bytes, fg_ratio: float, force_cpu: bool = False,
+                    report: Optional[Callable[[str], None]] = None):
+        """Background removal (rembg) + foreground crop/pad to a square frame.
+
+        report: optional callback receiving a progress label, so the UI can tell
+        a fresh rembg pass apart from a matte-cache hit.
 
         force_cpu=True avoids rembg using the CUDA onnxruntime provider, which
         corrupts the PyTorch CUDA context when the Trellis2 pipeline is already
         loaded and VRAM is under pressure (error 700 propagates to all subsequent
-        torch.cuda calls).
+        torch.cuda calls). It is irrelevant on a cache hit: no session is created.
         """
         from PIL import Image as PILImage
 
         image = PILImage.open(io.BytesIO(image_bytes)).convert("RGBA")
+        matted = self._matte_background(image, image_bytes, force_cpu, report)
+        return self._crop_foreground(self._composite_on_white(matted), fg_ratio)
 
+    def _matte_background(self, image, image_bytes: bytes, force_cpu: bool = False,
+                          report: Optional[Callable[[str], None]] = None):
+        """Return `image` with its background cut out, or `image` if rembg is unusable.
+
+        Successful mattes are cached across node instances, keyed by the raw input
+        bytes: a workflow preprocesses the identical image once per node, so the
+        second rembg pass was pure waste. The cached PIL image is shared read-only.
+        """
+        cache_key = self._matte_cache_key(image_bytes)
+        cached    = self._matte_cache_get(cache_key)
+        if cached is not None:
+            if report:
+                report("Reusing cached matte...")
+            return cached
+
+        if report:
+            report("Removing background...")
         try:
-            import rembg
-            if force_cpu:
-                session = rembg.new_session(providers=["CPUExecutionProvider"])
-                image   = rembg.remove(image, session=session)
-            else:
-                try:
-                    session = rembg.new_session()
-                    image   = rembg.remove(image, session=session)
-                except Exception:
-                    session = rembg.new_session(providers=["CPUExecutionProvider"])
-                    image   = rembg.remove(image, session=session)
+            matted = self._rembg_remove(image, force_cpu=force_cpu)
         except Exception as exc:
+            # rembg missing or failing: keep preprocessing usable on the raw image.
             print(f"[Trellis2GGUFGenerator] Background removal skipped: {exc}")
+            return image
 
-        # Composite on white background
-        bg = PILImage.new("RGBA", image.size, (255, 255, 255, 255))
-        bg.paste(image, mask=image.split()[3])
-        image = bg.convert("RGB")
+        self._matte_cache_put(cache_key, matted)
+        return matted
 
-        return self._resize_foreground(image, fg_ratio)
+    def _composite_on_white(self, image):
+        """Flatten a matted RGBA image onto an opaque white background (-> RGB)."""
+        from PIL import Image as PILImage
 
-    def _resize_foreground(self, image, ratio: float):
+        canvas = PILImage.new("RGBA", image.size, _WHITE_RGB + (255,))
+        canvas.paste(image, mask=image.split()[3])
+        return canvas.convert("RGB")
+
+    def _crop_foreground(self, image, ratio: float):
+        """Crop the non-white foreground, scale it to `ratio` of the frame, centre on white."""
         import numpy as np
         from PIL import Image as PILImage
 
         arr  = np.array(image)
-        mask = ~np.all(arr >= 250, axis=-1)
+        mask = ~np.all(arr >= _NEAR_WHITE_MIN, axis=-1)
         if not mask.any():
             return image
 
@@ -1569,6 +1622,63 @@ class Trellis2GGUFGenerator(BaseGenerator):
         fg     = fg.resize((nw, nh), PILImage.LANCZOS)
 
         sq     = max(iw, ih)
-        result = PILImage.new("RGB", (sq, sq), (255, 255, 255))
+        result = PILImage.new("RGB", (sq, sq), _WHITE_RGB)
         result.paste(fg, ((sq - nw) // 2, (sq - nh) // 2))
         return result
+
+    # ------------------------------------------------------------------ #
+    # rembg matte cache + session cache                                   #
+    # ------------------------------------------------------------------ #
+
+    def _matte_cache_key(self, image_bytes: bytes) -> str:
+        """In-process key identifying one input image."""
+        return hashlib.blake2b(image_bytes, digest_size=16).hexdigest()
+
+    def _matte_cache_get(self, cache_key: str):
+        """Cached matte for `cache_key`, or None. Touches the entry to keep it hot."""
+        with _preprocess_cache_lock:
+            cached = _matte_cache.get(cache_key)
+            if cached is None:
+                return None
+            _matte_cache.move_to_end(cache_key)
+            return cached
+
+    def _matte_cache_put(self, cache_key: str, matted) -> None:
+        """Store a matte, evicting the coldest entries beyond the size cap."""
+        with _preprocess_cache_lock:
+            _matte_cache[cache_key] = matted
+            _matte_cache.move_to_end(cache_key)
+            while len(_matte_cache) > _MATTE_CACHE_MAX_ENTRIES:
+                _matte_cache.popitem(last=False)
+
+    def _rembg_remove(self, image, force_cpu: bool = False):
+        """Matte `image` with rembg, retrying on CPU providers when the first pass fails."""
+        import rembg  # lazy: the wheel lives in the extension venv added to sys.path
+
+        if force_cpu:
+            return rembg.remove(image, session=self._rembg_session(cpu=True))
+        try:
+            return rembg.remove(image, session=self._rembg_session(cpu=False))
+        except Exception:
+            # CUDA provider crash or unbuildable session -> CPU matting.
+            return rembg.remove(image, session=self._rembg_session(cpu=True))
+
+    def _rembg_session(self, cpu: bool = False):
+        """Return the rembg session for a provider set, building each one at most once.
+
+        new_session() re-loads the matting model; it used to run on every
+        preprocessing call, i.e. once per node.
+        """
+        import rembg
+
+        provider_key = "cpu" if cpu else "auto"
+        with _preprocess_cache_lock:
+            session = _rembg_sessions.get(provider_key)
+        if session is not None:
+            return session
+
+        session = (rembg.new_session(providers=["CPUExecutionProvider"])
+                   if cpu else rembg.new_session())
+        with _preprocess_cache_lock:
+            _rembg_sessions[provider_key] = session
+        return session

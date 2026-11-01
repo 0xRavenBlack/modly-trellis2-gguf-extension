@@ -662,10 +662,13 @@ def setup(python_exe: str, ext_dir: Path, gpu_sm: int, cuda_version: int = 0) ->
     _pip(venv, "install", *_PY_PACKAGES)
 
     # ── rembg (background removal) ───────────────────────────────────── #
-    # CPU onnxruntime only: the runtime always forces CPUExecutionProvider
-    # (see generator._preprocess force_cpu=True) to avoid corrupting the
-    # torch CUDA context. onnxruntime-gpu (rembg[gpu]) is unused and its
-    # wheel download fails pip hash verification.
+    # CPU onnxruntime only: matting is forced to CPUExecutionProvider on the
+    # Texture Mesh node, where the Trellis2 pipeline is already resident in VRAM
+    # and onnxruntime's CUDA provider crashes with error 700, corrupting the
+    # torch CUDA context for every later call (generator._preprocess force_cpu=True).
+    # The matte is cached across nodes, so rembg and its onnxruntime session usually
+    # run once per workflow. onnxruntime-gpu (rembg[gpu]) is therefore unused and
+    # its wheel download fails pip hash verification.
     print("[setup] Installing rembg …")
     _pip(venv, "install", "rembg", "onnxruntime")
 
