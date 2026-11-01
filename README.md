@@ -34,6 +34,8 @@ The workflow above is the recommended starting point. It chains the two nodes ba
 
 **Output:** geometry GLB (no texture)
 
+The remeshed result is capped at ~1M triangles (the same decimation target used by upstream `o_voxel.to_glb()`), so files stay manageable even at 768/1024 remesh resolution.
+
 ### Texture Mesh
 
 | Parameter | Description | Default |
@@ -48,6 +50,8 @@ The workflow above is the recommended starting point. It chains the two nodes ba
 | `seed` | Reproducibility seed | `0` |
 
 **Output:** textured GLB
+
+Input meshes above ~1M triangles are automatically decimated on the CPU before UV unwrapping. This is required because the GPU chart computation allocates memory proportional to the face count and would otherwise run out of VRAM on dense Trellis2 meshes.
 
 ---
 

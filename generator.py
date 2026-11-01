@@ -76,6 +76,17 @@ _SLAT_RESCALE_T    = 4.0
 # model enough voxels for full detail without unbounded VRAM growth.
 _MAX_NUM_TOKENS    = 150000
 
+# Face budgets for the two GPU mesh stages.
+#
+# The narrow-band dual-contouring remesh can emit 10-20M triangles at 768/1024
+# resolution.  Upstream o_voxel.to_glb() always runs cumesh.simplify() with a
+# 1M decimation target after remeshing; our export path used to omit that step,
+# producing 250-600 MB GLBs and overflowing VRAM later when cumesh built the
+# UV charts (a face-count-proportional allocation).  Cap both the generated
+# output and the Texture Mesh input so older/oversized meshes are handled too.
+_MAX_OUTPUT_FACES  = 1_000_000
+_MAX_TEXTURE_FACES = 1_000_000
+
 
 class Trellis2GGUFGenerator(BaseGenerator):
     MODEL_ID     = "trellis2"
@@ -896,6 +907,19 @@ class Trellis2GGUFGenerator(BaseGenerator):
             raise ValueError(f"Could not load a valid mesh from: {mesh_path}")
         print(f"[Trellis2GGUFGenerator] Loaded mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
 
+        # cumesh's UV-chart computation allocates GPU memory proportional to the
+        # face count.  Meshes produced by older versions of Generate Mesh (or by
+        # other mesh nodes) can have 10M+ faces, which overflows VRAM inside
+        # postprocess_mesh().  Decimate on the CPU before entering the pipeline.
+        max_faces = int(params.get("max_texture_faces", _MAX_TEXTURE_FACES) or _MAX_TEXTURE_FACES)
+        if len(mesh.faces) > max_faces:
+            self._report(progress_cb, 5,
+                         f"Simplifying mesh {len(mesh.faces):,} -> {max_faces:,} faces...")
+            print(f"[Trellis2GGUFGenerator] Decimating mesh: {len(mesh.faces)} -> {max_faces} faces")
+            mesh = self._decimate_mesh_cpu(mesh, max_faces)
+            print(f"[Trellis2GGUFGenerator] Decimated mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+        self._check_cancelled(cancel_event)
+
         # --- Pre-process image ---
         # force_cpu=True: the Trellis2 pipeline is already loaded in VRAM.
         # rembg's onnxruntime CUDA provider crashes with error 700 under VRAM
@@ -1075,7 +1099,21 @@ class Trellis2GGUFGenerator(BaseGenerator):
                 cm.fill_holes(max_hole_perimeter=0.1)
                 cm.repair_non_manifold_edges()
 
+            # Match upstream o_voxel.to_glb(): cap the mesh after remeshing.
+            # A 768/1024 remesh can produce 10-20M faces, which makes the GLB
+            # enormous and later OOMs cumesh while building UV charts.
+            try:
+                _before = cm.num_faces
+                cm.simplify(_MAX_OUTPUT_FACES, verbose=False)
+                if cm.num_faces != _before:
+                    print(f"[Trellis2GGUFGenerator] Decimated mesh: "
+                          f"{_before:,} -> {cm.num_faces:,} faces")
+            except Exception as simp_exc:
+                print(f"[Trellis2GGUFGenerator] cumesh simplify failed ({simp_exc}); "
+                      f"exporting {cm.num_faces:,} faces")
+
             cm.unify_face_orientations()
+
             _vout, _fout = cm.read()
             verts = _vout.cpu().numpy().astype(np.float32)
             faces = _fout.cpu().numpy().astype(np.int32)
@@ -1416,6 +1454,59 @@ class Trellis2GGUFGenerator(BaseGenerator):
     # ------------------------------------------------------------------ #
     # Helpers                                                             #
     # ------------------------------------------------------------------ #
+
+    def _decimate_mesh_cpu(self, mesh, target_faces: int):
+        """Reduce *mesh* to roughly *target_faces* using CPU decimation.
+
+        cumesh's GPU UV unwrapping needs memory proportional to the face count,
+        so oversized meshes must be reduced before Texture Mesh.  Prefer
+        pymeshlab (declared dependency) and fall back to open3d; both run on the
+        CPU and therefore leave the GPU free for the Trellis2 pipeline.
+        """
+        import numpy as np
+        import trimesh
+
+        if len(mesh.faces) <= target_faces:
+            return mesh
+
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+
+        try:
+            import pymeshlab as _pml
+            ms = _pml.MeshSet()
+            ms.add_mesh(_pml.Mesh(vertex_matrix=verts, face_matrix=faces))
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=int(target_faces),
+                preserveboundary=True,
+                preservenormal=True,
+                optimalplacement=True,
+            )
+            out = ms.current_mesh()
+            new_v = np.asarray(out.vertex_matrix(), dtype=np.float32)
+            new_f = np.asarray(out.face_matrix(), dtype=np.int32)
+            if len(new_f) > 0:
+                return trimesh.Trimesh(vertices=new_v, faces=new_f, process=False)
+        except Exception as exc:
+            print(f"[Trellis2GGUFGenerator] pymeshlab decimation failed ({exc}); trying open3d")
+
+        try:
+            import open3d as _o3d
+            om = _o3d.geometry.TriangleMesh(
+                _o3d.utility.Vector3dVector(verts),
+                _o3d.utility.Vector3iVector(faces),
+            )
+            om = om.simplify_quadric_decimation(target_number_of_triangles=int(target_faces))
+            new_v = np.asarray(om.vertices, dtype=np.float32)
+            new_f = np.asarray(om.triangles, dtype=np.int32)
+            if len(new_f) > 0:
+                return trimesh.Trimesh(vertices=new_v, faces=new_f, process=False)
+        except Exception as exc:
+            print(f"[Trellis2GGUFGenerator] open3d decimation failed ({exc})")
+
+        print("[Trellis2GGUFGenerator] WARNING: could not decimate mesh; "
+              "texture UV unwrapping may run out of VRAM")
+        return mesh
 
     def _resolve_seed(self, params: dict) -> int:
         seed = int(params.get("seed", -1))
